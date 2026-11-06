@@ -1,391 +1,117 @@
 # SecondProject — STC89C52 Smart Lock Firmware
 
-A cooperative-multitasking firmware for the **STC89C52** microcontroller implementing a password-based electronic lock.  
-The project is split into two layers:
+## Feature Specification
+
+1. **Input operations:** Supports digit input, delete, clear, confirm, lock, cancel-modify, and change-password. Keyboard and serial port share the same input pipeline and can be used interchangeably. Fewer than 6 digits entered does not count as an error; more than 6 digits cannot overwrite the existing entry. A correct password unlocks; a wrong password clears the input and increments the error counter.
+
+2. **Password change:** Only permitted after unlocking. The new password must be entered twice consecutively and match to be saved; leading zeros are preserved. Canceling, locking, or a power loss mid-change does not commit a partial password. If a save-success prompt has already been shown before power is cut, the new password remains valid.
+
+3. **Idle auto-lock:** During unlock or password-change, 15 seconds of inactivity automatically re-locks the device. Status / version queries and invalid operations do not reset the idle timer. Holding a key fires only one event; prompts respond normally while the timer is counting.
+
+4. **Error lockout:** The 3rd consecutive error triggers a **30-second pause** (error count retained on expiry). The 5th consecutive error triggers a **60-second lockout** *(unified receipt value)*; the error count clears on expiry. A correct unlock also clears the error count. During lockout only status queries are allowed — the lock cannot be released early. **Error count and lockout state must survive a power cycle.** Restarting during lockout requires waiting out the full remaining duration.
+
+5. **7-segment display (left to right):** Digit 1 = status code, Digit 2 = error count, Digits 3–8 = current input in real time (unentered positions show `–`). Status codes 0–6 correspond to: Locked / Unlocked / First-new-password / Re-enter-new-password / Paused / Protected / ISP-ready. While unlocked, an auto-lock countdown is shown in the form `----15`. During lockout the remaining seconds are shown zero-padded to 6 digits. Every key press or complete serial command triggers an audible beep starting within **100 ms**; long blocking delays must not be used for this purpose.
+
+6. **ISP upgrade:** Only a normal (password-correct) unlock enables ISP entry. After a non-power-off software reset, the chip enters its ISP bootloader; the PC tool completes the download and verification. The new firmware locks the device on first boot and retains the previously saved password, ready for the next upgrade cycle.
+
+---
+
+A cooperative-multitasking firmware for the **STC89C52** microcontroller implementing a password-based electronic lock.
 
 | Folder | Purpose |
 |--------|---------|
-| `Tools/` | Reusable hardware-abstraction drivers (this document) |
-| `Core/`  | Application logic — lock state machine, input handling, display, UART protocol, EEPROM persistence |
+| `Tools/` | Hardware-abstraction drivers |
+| `Core/`  | Application logic — lock state machine, input, display, UART protocol, EEPROM persistence |
+
+> **Build:** STC89C52RC · 11.0592 MHz · Keil C51
 
 ---
 
-## Table of Contents
+## Tools/Timer — Cooperative Task Scheduler
 
-- [Architecture Overview](#architecture-overview)
-- [Module: Timer](#module-timer-timerc--timerh)
-- [Module: UART](#module-uart-uartc--uarth)
-- [Module: I2C](#module-i2c-i2cc--i2ch)
-- [Module: E2PROM](#module-e2prom-e2promc--e2promh)
-- [Module: LEDDisplay](#module-leddisplay-leddisplayc--leddisplayh)
-- [Module: MatrixKey](#module-matrixkey-matrixkeyc--matrixkeyh)
-- [Dependencies](#dependencies)
+Backed by Timer 2 (1 ms tick). Supports up to `MAX_TASKS` (15) concurrent tasks.
 
----
-
-## Architecture Overview
-
-```
-main()
-  ├── Timer0Init()          — start cooperative scheduler (Timer2 ISR)
-  ├── UARTInit()            — start serial port (Timer1 baud, UART ISR)
-  ├── MatrixKeyRegister()   — register key-scan task
-  └── while(1)
-        ├── TaskProcess()   — dispatch all due tasks
-        ├── InputMatrixKey()
-        └── LockUARTProcess()
-```
-
-The scheduler drives every periodic action via `TaskAdd` / `TaskProcess`.  
-No `Delay()` calls are used in the main loop; blocking delays are only used during initialisation.
+| Function | Description |
+|----------|-------------|
+| `Timer0Init()` | Initialize Timer 2 and the task table. Call once at startup. |
+| `Timer0Routine()` | *(ISR, interrupt 5)* Increments tick counter; drives LED refresh and feedback blink. |
+| `TaskProcess()` | Dispatch all due tasks. **Call in the main loop.** |
+| `TaskAdd(period, fn)` | Register `fn` to run every `period` ms. Returns `1` on success. |
+| `TaskDelete(fn)` | Remove `fn` from the scheduler. |
+| `TaskSetPeriod(period, fn)` | Change the period of a registered task. |
+| `TaskGetPeriod(fn)` | Return the current period of a task (ms). |
+| `TaskExist(fn)` | Return `1` if `fn` is registered. |
+| `TaskCount()` | Return the number of active tasks. |
+| `TaskGetTick()` | Return current tick count (ms), read atomically. |
+| `TaskGetNextTick(fn)` | Return the next scheduled tick for `fn`. |
+| `Delay(ms)` | Blocking software delay. Avoid in the main loop. |
 
 ---
 
-## Module: Timer (`Timer.c` / `Timer.h`)
+## Tools/UART — Interrupt-Driven Serial Driver
 
-Cooperative task scheduler backed by **Timer 2** (1 ms tick, accuracy-corrected).  
-Up to `MAX_TASKS` (15) tasks can be registered simultaneously.
+Ring-buffer TX (64 bytes), 9600 baud. Received bytes are forwarded to `LockUART_ReceiveISR()`.
 
-### Public API
-
-#### `void Timer0Init()`
-Initialises Timer 2 and the internal task table.  
-**Must be called once before any other Timer / Task function.**  
-Configures the reload values to produce a nominal 1 ms interrupt.
-
----
-
-#### `void Timer0Routine()` *(ISR, interrupt 5)*
-Timer 2 interrupt service routine.  
-- Increments the global tick counter.
-- Drives the LED multiplex loop (`ShowLoop`) and feedback blink (`TaskFeedback`) at half rate (every 2 ticks).
-- **Not called directly** — invoked automatically by hardware.
+| Function | Description |
+|----------|-------------|
+| `UARTInit()` | Configure baud rate (Timer 1) and enable the serial interrupt. Call once at startup. |
+| `UARTRoutine()` | *(ISR, interrupt 4)* Handles RX forwarding and TX ring-buffer draining. |
+| `UARTByteSender(byte)` | Enqueue one byte for TX. Returns `1` on success, `0` if buffer full. |
+| `UARTStringSender(str)` | Enqueue a null-terminated string atomically. Returns `1` on success. |
+| `UARTTxFree()` | Return the number of free bytes in the TX buffer. |
+| `UARTTransmitIdle()` | Return `1` if the TX hardware is idle. |
 
 ---
 
-#### `unsigned long TaskGetTick()`
-Returns the current tick count (ms since `Timer0Init()`).  
-Disables interrupts atomically while reading the 32-bit value.
+## Tools/I2C — Bit-Banged I²C Master
 
-```c
-unsigned long now = TaskGetTick();
-```
+Operates on **P2.0 (SDA)** and **P2.1 (SCL)**. Used internally by E2PROM.
 
----
-
-#### `unsigned long TaskGetNextTick(TaskFunction function)`
-Returns the tick value at which `function` is scheduled to run next.  
-Returns `0` if the function is not registered.
-
----
-
-#### `void TaskProcess()`
-**Call in the main loop.** Iterates every registered task and calls those whose next-tick deadline has passed.  
-Re-entrant guard prevents nested execution.
-
-```c
-while (1) {
-    TaskProcess();
-    /* other work */
-}
-```
+| Function | Description |
+|----------|-------------|
+| `I2CStart()` | Generate START condition. |
+| `I2CStop()` | Generate STOP condition. |
+| `I2CByteSender(byte)` | Clock out 8 bits MSB-first. |
+| `I2CByteReceiver()` | Clock in 8 bits MSB-first; return received byte. |
+| `I2CSendACK(bit)` | Send ACK (`0`) or NACK (`1`). |
+| `I2CReceiveACK()` | Read slave ACK bit. Returns `0` = ACK, `1` = NACK. |
 
 ---
 
-#### `unsigned char TaskAdd(unsigned int period, TaskFunction function)`
-Registers `function` to be called every `period` milliseconds.  
-- Returns `1` on success, `0` on failure (table full or bad arguments).  
-- If `function` is already registered, returns `1` without duplicating it.  
-- Increments `taskAddFailures` on table-full conditions.
+## Tools/E2PROM — AT24C02 EEPROM Driver
 
-```c
-TaskAdd(20, MatrixKeyScan);   // scan keys every 20 ms
-TaskAdd(1,  TaskSavePending); // check pending save every ms
-```
+Non-blocking write driver (256 bytes, I²C address `0xA0`). Requires `E2PROMWriteTask` to be registered in the scheduler.
 
----
-
-#### `void TaskDelete(TaskFunction function)`
-Removes `function` from the scheduler. Safe to call with a NULL or unregistered function.
+| Function | Description |
+|----------|-------------|
+| `E2PROMIsReady()` | Poll the chip; return `1` if the internal write cycle is done. |
+| `E2PROMIsBusy()` | Return `1` if a write/erase is in progress. |
+| `E2PROMAsyncByteWriter(addr, data)` | Start a non-blocking byte write. Returns `1` if accepted. |
+| `E2PROMByteReader(addr)` | Blocking byte read. Returns `0xFF` on error. |
+| `E2PROMReadOK()` | Return `1` if the last read succeeded. |
+| `E2PROMWriteTask()` | Task function — advances the write-cycle state machine. Register with `TaskAdd`. |
+| `ClearE2PROM()` | Schedule an async full-chip erase (all bytes → `0xFF`). |
 
 ---
 
-#### `void TaskSetPeriod(unsigned int period, TaskFunction function)`
-Changes the execution period of an already-registered task and resets its next deadline.
+## Tools/LEDDisplay — 8-Digit 7-Segment Display
+
+Multiplexed via a 3-bit latch (P2.2–P2.4) and segment data on P0. Refreshed by the Timer ISR.
+
+| Function | Description |
+|----------|-------------|
+| `SetBuf(pos, num)` | Write digit `num` (0–10) to display buffer position `pos` (1–8). |
+| `LEDDisplay(pos, num)` | Directly drive one digit. Called internally by `ShowLoop`. |
+| `ShowLoop()` | Advance the multiplex cycle by one digit. Called from the Timer ISR. |
 
 ---
 
-#### `unsigned int TaskGetPeriod(TaskFunction function)`
-Returns the current period (ms) of a registered task, or `0` if not found.
-
----
-
-#### `unsigned char TaskExist(TaskFunction function)`
-Returns `1` if `function` is currently registered, `0` otherwise.
-
----
-
-#### `unsigned char TaskCount()`
-Returns the number of active tasks in the scheduler.
-
----
-
-#### `void Delay(unsigned int ms)`
-Blocking software delay in milliseconds.  
-Uses `_nop_()` loops calibrated for 11.0592 MHz.  
-**Avoid in the main loop** — use the task scheduler instead.
-
----
-
-#### Global: `unsigned char taskAddFailures`
-Counts the number of times `TaskAdd` failed due to a full task table. Useful for debugging.
-
----
-
-## Module: UART (`UART.c` / `UART.h`)
-
-Interrupt-driven, ring-buffer UART driver.  
-TX buffer size: `UART_TX_SIZE` (64 bytes). Baud rate: **9600** (11.0592 MHz, SMOD=1, Timer 1 auto-reload).  
-Received bytes are forwarded directly to `LockUART_ReceiveISR()` in the Core layer.
-
-### Public API
-
-#### `void UARTInit()`
-Configures Timer 1 as the baud-rate generator, sets SCON to mode 1 (8-bit variable baud), and enables the serial interrupt.  
-**Call once before transmitting or receiving.**
-
----
-
-#### `void UARTRoutine()` *(ISR, interrupt 4)*
-Serial interrupt handler.  
-- **RX**: clears `RI`, passes `SBUF` to `LockUART_ReceiveISR()`.  
-- **TX**: clears `TI`, sends the next byte from the ring buffer or clears the busy flag.  
-- **Not called directly.**
-
----
-
-#### `unsigned char UARTTxFree()`
-Returns the number of free bytes remaining in the TX ring buffer.  
-Use to check whether a string will fit before sending.
-
-```c
-if (UARTTxFree() >= len) { /* safe to send */ }
-```
-
----
-
-#### `unsigned char UARTTransmitIdle()`
-Returns `1` if the TX hardware is idle (buffer empty and no byte being shifted out), `0` otherwise.  
-Useful for detecting end-of-transmission before entering low-power mode.
-
----
-
-#### `unsigned char UARTByteSender(unsigned char byte)`
-Enqueues a single byte for transmission.  
-Returns `1` on success, `0` if the buffer is full.
-
-```c
-UARTByteSender('A');
-```
-
----
-
-#### `unsigned char UARTStringSender(char *string)`
-Enqueues a null-terminated string for transmission atomically (all-or-nothing).  
-Returns `1` on success, `0` if the string is too long or the buffer has insufficient space.
-
-```c
-UARTStringSender("OK\r\n");
-```
-
----
-
-## Module: I2C (`I2C.c` / `I2C.h`)
-
-Bit-banged I²C master on **P2.0 (SDA)** and **P2.1 (SCL)**.  
-Used exclusively by the E2PROM module; not intended for direct use from application code.
-
-### Public API
-
-#### `void I2CStart()`
-Generates an I²C START condition (SDA falls while SCL is high) and clamps the bus.
-
-#### `void I2CStop()`
-Generates an I²C STOP condition (SDA rises while SCL is high) and releases the bus.
-
-#### `void I2CByteSender(unsigned char byte)`
-Clocks out 8 bits MSB-first on SDA.
-
-#### `unsigned char I2CByteReceiver()`
-Clocks in 8 bits MSB-first from SDA. Releases SDA before reading.  
-Returns the received byte.
-
-#### `void I2CSendACK(unsigned char ACKBit)`
-Sends an ACK (`0`) or NACK (`1`) after receiving a byte.
-
-#### `unsigned char I2CReceiveACK()`
-Reads the ACK/NACK bit from the slave.  
-Returns `0` = ACK (slave acknowledged), `1` = NACK.
-
----
-
-## Module: E2PROM (`E2PROM.c` / `E2PROM.h`)
-
-Non-blocking driver for an **AT24C02** EEPROM (256 bytes, I²C address `0xA0`).  
-Writes are asynchronous: `E2PROMAsyncByteWriter` initiates the write cycle, and `E2PROMWriteTask` (registered with the scheduler) polls for completion.
-
-### Public API
-
-#### `bit E2PROMIsReady()`
-Polls the EEPROM via I²C to check whether its internal write cycle has finished.  
-Returns `1` if the device acknowledges (ready), `0` if still busy.
-
----
-
-#### `bit E2PROMIsBusy()`
-Returns `1` if a write or erase operation is in progress (i.e., the driver's state machine is active), `0` if idle.  
-Use this to avoid issuing a new write before the previous one completes.
-
-```c
-if (!E2PROMIsBusy()) {
-    E2PROMAsyncByteWriter(addr, data);
-}
-```
-
----
-
-#### `bit E2PROMAsyncByteWriter(unsigned char address, unsigned char _data)`
-Initiates a non-blocking byte write to `address`.  
-Returns `1` if the write was started successfully, `0` if the driver is busy or the hardware did not acknowledge.  
-After calling this, `E2PROMWriteTask` must be running in the scheduler to finalise the cycle.
-
----
-
-#### `unsigned char E2PROMByteReader(unsigned char address)`
-Blocking byte read from `address`.  
-Returns the byte value, or `0xFF` on communication error.  
-Check `E2PROMReadOK()` after the call to confirm success.
-
-```c
-unsigned char val = E2PROMByteReader(0x00);
-if (E2PROMReadOK()) { /* val is valid */ }
-```
-
----
-
-#### `bit E2PROMReadOK()`
-Returns `1` if the last `E2PROMByteReader` call completed without error, `0` otherwise.
-
----
-
-#### `void E2PROMWriteTask()`
-Task function to be registered with the scheduler (called periodically).  
-Advances the internal write-cycle state machine: waits for the EEPROM to become ready after a write, then continues any pending erase operation.  
-Register with: `TaskAdd(1, E2PROMWriteTask)`.
-
----
-
-#### `void ClearE2PROM()`
-Schedules an asynchronous full-chip erase (fills all 256 bytes with `0xFF`).  
-The erase runs byte-by-byte through `E2PROMWriteTask`; it is non-blocking.  
-Safe to call while other writes are not pending.
-
----
-
-## Module: LEDDisplay (`LEDDisplay.c` / `LEDDisplay.h`)
-
-8-digit 7-segment LED display driver using a 3-bit address latch (P2.2–P2.4) and segment data on P0.  
-Display is refreshed by the Timer ISR at ~500 Hz (every 2 ms per digit cycling through 8 digits).
-
-### Public API
-
-#### `void LEDDisplay(unsigned char pos, unsigned char num)`
-Directly drives segment `pos` (1–8) with digit `num` (0–9, or `10` for a dash `–`).  
-Called internally by `ShowLoop`; can also be called directly for one-shot display.
-
----
-
-#### `void ShowLoop()`
-Advances the multiplexed display by one digit per call.  
-**Called from the Timer ISR** every 2 ms — do not call from application code.
-
----
-
-#### `void SetBuf(unsigned char location, unsigned char number)`
-Writes `number` (0–10) into display buffer position `location` (1–8).  
-The change will appear on the next `ShowLoop` cycle.
-
-```c
-SetBuf(1, 5);  // show digit '5' on the first display segment
-SetBuf(5, 10); // show '–' (blank/dash) on segment 5
-```
-
----
-
-#### Global: `volatile unsigned char buf[9]`
-Raw display buffer (index 1–8 correspond to display positions 1–8).  
-Prefer `SetBuf()` over direct access.
-
-#### Global: `unsigned char isRegisterLEDDisplay`
-Flag indicating whether the LED display task has been registered. Currently unused by the driver itself; available for external checks.
-
----
-
-## Module: MatrixKey (`MatrixKey.c` / `MatrixKey.h`)
-
-4×4 matrix keypad driver. Keys are numbered 0–15; value `16` means "no key pressed / key released".  
-Scanning is registered as a periodic task (every 20 ms) to provide software debouncing.
-
-### Public API
-
-#### `void MatrixKeyRegister()`
-Registers `MatrixKeyScan` with the task scheduler (20 ms period) if not already registered.  
-Sets `isMatrixKeyRegistered` to `1` on success.  
-**Call once during initialisation.**
-
-```c
-MatrixKeyRegister();
-```
-
----
-
-#### `unsigned char MatrixKeyGet()`
-Returns the last detected key number (0–15) and clears the pending event.  
-Returns `16` if no new key has been pressed since the last call.  
-Use this in the main loop to consume key events one at a time.
-
-```c
-unsigned char key = MatrixKeyGet();
-if (key != 16) { /* handle key */ }
-```
-
----
-
-#### `void MatrixKeyScan()` *(task function)*
-Scans the 4×4 matrix and updates `globalMatrixKey` on a new key-down edge.  
-Registered automatically by `MatrixKeyRegister()`; **do not call directly**.
-
----
-
-#### Global: `volatile unsigned char globalMatrixKey`
-Holds the most recent key number. Reset to `16` by `MatrixKeyGet()` after consumption.
-
-#### Global: `unsigned char isMatrixKeyRegistered`
-`1` if the scan task was registered successfully, `0` otherwise.
-
----
-
-## Dependencies
-
-```
-Tools/Timer    ←─ Tools/LEDDisplay
-                ←─ Tools/MatrixKey
-                ←─ Tools/UART (Timer1 for baud only)
-                ←─ Core/LockFeedback  (TaskFeedback called in ISR)
-
-Tools/I2C      ←─ Tools/E2PROM
-
-Tools/UART     ←─ Core/LockUART  (LockUART_ReceiveISR called in ISR)
-```
-
-> **Build target:** STC89C52RC, 11.0592 MHz crystal, Keil C51 toolchain.
+## Tools/MatrixKey — 4×4 Matrix Keypad
+
+Keys numbered 0–15; `16` = no key / released. Scan registered as a 20 ms task.
+
+| Function | Description |
+|----------|-------------|
+| `MatrixKeyRegister()` | Register the scan task with the scheduler. Call once at startup. |
+| `MatrixKeyGet()` | Return the latest key (0–15) and clear the event; returns `16` if none. |
+| `MatrixKeyScan()` | *(task function)* Scan the matrix and update `globalMatrixKey`. Registered automatically. |
