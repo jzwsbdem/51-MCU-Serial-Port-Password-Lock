@@ -1,4 +1,4 @@
-# SecondProject — STC89C52 Smart Lock Firmware
+# STC89C52 Smart Lock Firmware
 
 ## Feature Specification
 
